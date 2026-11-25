@@ -1,6 +1,6 @@
 // Token Radar dashboard client (radar-3).
-// Renders the offline board, filters, sorting, charts, methodology panel, and protocol
-// detail drawer directly from window.RADAR (loaded via ../data.js).
+// Draws the offline board, filters, sorting, charts, methodology panel, and protocol
+// detail drawer straight from window.RADAR (loaded through ../data.js).
 (() => {
   'use strict';
 
@@ -43,10 +43,10 @@
 
   function formatUsd(value) {
     if (value === null || value === undefined || !Number.isFinite(value)) return 'n/a';
-    const abs = Math.abs(value);
-    if (abs >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
-    if (abs >= 1e6) return `$${(value / 1e6).toFixed(1)}M`;
-    if (abs >= 1e3) return `$${Math.round(value / 1e3)}K`;
+    const magnitude = Math.abs(value);
+    if (magnitude >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
+    if (magnitude >= 1e6) return `$${(value / 1e6).toFixed(1)}M`;
+    if (magnitude >= 1e3) return `$${Math.round(value / 1e3)}K`;
     return currencyFormatter.format(value);
   }
 
@@ -55,10 +55,10 @@
     return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`;
   }
 
-  function formatAge(days) {
-    if (days === null || days === undefined) return 'unknown';
-    if (days >= 365) return `${(days / 365).toFixed(1)}y`;
-    return `${Math.max(0, Math.round(days))}d`;
+  function formatAge(dayCount) {
+    if (dayCount === null || dayCount === undefined) return 'unknown';
+    if (dayCount >= 365) return `${(dayCount / 365).toFixed(1)}y`;
+    return `${Math.max(0, Math.round(dayCount))}d`;
   }
 
   function formatFixed4(value) {
@@ -66,13 +66,13 @@
     return Number(value).toFixed(4);
   }
 
-  function summarizeChains(chains, maxCount) {
+  function summarizeChains(chains, limit) {
     if (!chains || chains.length === 0) return 'an unnamed chain';
-    return maxCount ? chains.slice(0, maxCount).join(', ') : chains.join(', ');
+    return limit ? chains.slice(0, limit).join(', ') : chains.join(', ');
   }
 
-  function escapeHtml(text) {
-    return String(text)
+  function escapeHtml(raw) {
+    return String(raw)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -84,48 +84,48 @@
   // -------------------------------------------------------------------------
 
   function h(tag, props, ...children) {
-    const node = document.createElement(tag);
+    const el = document.createElement(tag);
     if (props) {
-      for (const [key, val] of Object.entries(props)) {
-        if (val === null || val === undefined) continue;
-        if (key === 'class') node.className = val;
-        else if (key === 'text') node.textContent = val;
-        else if (key === 'html') node.innerHTML = val;
-        else if (key.startsWith('on')) node.addEventListener(key.slice(2), val);
-        else node.setAttribute(key, String(val));
+      for (const [attr, value] of Object.entries(props)) {
+        if (value === null || value === undefined) continue;
+        if (attr === 'class') el.className = value;
+        else if (attr === 'text') el.textContent = value;
+        else if (attr === 'html') el.innerHTML = value;
+        else if (attr.startsWith('on')) el.addEventListener(attr.slice(2), value);
+        else el.setAttribute(attr, String(value));
       }
     }
-    for (const child of children) {
-      if (child === null || child === undefined) continue;
-      if (Array.isArray(child)) {
-        for (const nested of child) {
-          if (nested !== null && nested !== undefined) {
-            node.appendChild(typeof nested === 'string' ? document.createTextNode(nested) : nested);
+    for (const item of children) {
+      if (item === null || item === undefined) continue;
+      if (Array.isArray(item)) {
+        for (const inner of item) {
+          if (inner !== null && inner !== undefined) {
+            el.appendChild(typeof inner === 'string' ? document.createTextNode(inner) : inner);
           }
         }
-      } else if (typeof child === 'string') {
-        node.appendChild(document.createTextNode(child));
+      } else if (typeof item === 'string') {
+        el.appendChild(document.createTextNode(item));
       } else {
-        node.appendChild(child);
+        el.appendChild(item);
       }
     }
-    return node;
+    return el;
   }
 
   // -------------------------------------------------------------------------
   // Client-side model verification & farm-step derivation (mirrors lib/model.ts)
   // -------------------------------------------------------------------------
 
-  function clamp(value, low, high) {
-    return Math.min(high, Math.max(low, value));
+  function clamp(amount, floor, ceiling) {
+    return Math.min(ceiling, Math.max(floor, amount));
   }
 
-  function escapeRegExp(text) {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function escapeRegExp(pattern) {
+    return pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  function hasKeyword(text, keyword) {
-    return new RegExp(`\\b${escapeRegExp(keyword)}`, 'i').test(text);
+  function hasKeyword(haystack, needle) {
+    return new RegExp(`\\b${escapeRegExp(needle)}`, 'i').test(haystack);
   }
 
   function maturityMultiplier(age, model) {
@@ -138,39 +138,37 @@
     }
     if (age <= model.maturity_sweet_end) return model.maturity_peak;
     if (age <= model.maturity_decline_end) {
-      const span = model.maturity_decline_end - model.maturity_sweet_end;
-      return (
-        model.maturity_peak -
-        (model.maturity_peak - model.maturity_young_floor) * ((age - model.maturity_sweet_end) / span)
-      );
+      const declineSpan = model.maturity_decline_end - model.maturity_sweet_end;
+      const fallShare = (age - model.maturity_sweet_end) / declineSpan;
+      return model.maturity_peak - (model.maturity_peak - model.maturity_young_floor) * fallShare;
     }
-    const over = Math.min(1, (age - model.maturity_decline_end) / model.maturity_decline_end);
-    return model.maturity_young_floor - (model.maturity_young_floor - model.maturity_old_floor) * over;
+    const beyondShare = Math.min(1, (age - model.maturity_decline_end) / model.maturity_decline_end);
+    return model.maturity_young_floor - (model.maturity_young_floor - model.maturity_old_floor) * beyondShare;
   }
 
   function recomputeImplied(row, model) {
-    const rawGrowth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
-    const growth = clamp(rawGrowth, model.growth_floor, model.growth_cap);
-    const growthMult = 1 + (growth / 100) * model.growth_weight;
-    const rawAge = row.age_days === null || row.age_days === undefined ? null : row.age_days;
-    const maturityMult = maturityMultiplier(rawAge, model);
+    const weeklyMove = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    const clampedMove = clamp(weeklyMove, model.growth_floor, model.growth_cap);
+    const growthFactor = 1 + (clampedMove / 100) * model.growth_weight;
+    const ageValue = row.age_days === null || row.age_days === undefined ? null : row.age_days;
+    const maturityFactor = maturityMultiplier(ageValue, model);
     const chainCount = Array.isArray(row.chains) ? row.chains.length : 0;
-    const chainMult = 1 + model.chain_step * clamp(chainCount - 1, 0, model.chain_cap);
-    return Math.max(1, Math.round(row.tvl_usd * row.ratio * growthMult * maturityMult * chainMult));
+    const chainFactor = 1 + model.chain_step * clamp(chainCount - 1, 0, model.chain_cap);
+    return Math.max(1, Math.round(row.tvl_usd * row.ratio * growthFactor * maturityFactor * chainFactor));
   }
 
   function signalScore(row) {
     const age = row.age_days;
-    let ageScore;
-    if (age === null || age === undefined) ageScore = 50;
-    else if (age >= 180 && age <= 540) ageScore = 100;
-    else if ((age >= 90 && age < 180) || (age > 540 && age <= 1095)) ageScore = 70;
-    else if (age < 90) ageScore = 40;
-    else ageScore = 30;
-    const growthScore = clamp(50 + (row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d), 0, 100);
-    const chainScore = Math.min(100, (Array.isArray(row.chains) ? row.chains.length : 0) * 10);
-    const categoryScore = row.ratio_n >= 3 ? 80 : row.ratio_n >= 1 ? 50 : 30;
-    return Math.round(0.35 * ageScore + 0.25 * growthScore + 0.15 * chainScore + 0.25 * categoryScore);
+    let agePoints;
+    if (age === null || age === undefined) agePoints = 50;
+    else if (age >= 180 && age <= 540) agePoints = 100;
+    else if ((age >= 90 && age < 180) || (age > 540 && age <= 1095)) agePoints = 70;
+    else if (age < 90) agePoints = 40;
+    else agePoints = 30;
+    const momentumPoints = clamp(50 + (row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d), 0, 100);
+    const reachPoints = Math.min(100, (Array.isArray(row.chains) ? row.chains.length : 0) * 10);
+    const evidencePoints = row.ratio_n >= 3 ? 80 : row.ratio_n >= 1 ? 50 : 30;
+    return Math.round(0.35 * agePoints + 0.25 * momentumPoints + 0.15 * reachPoints + 0.25 * evidencePoints);
   }
 
   const CATEGORY_PLAYBOOKS = [
@@ -287,9 +285,9 @@
   };
 
   function pickPlaybook(category) {
-    const normalized = (category || '').toLowerCase();
-    for (const pb of CATEGORY_PLAYBOOKS) {
-      if (pb.keywords.some((kw) => hasKeyword(normalized, kw))) return pb;
+    const folded = (category || '').toLowerCase();
+    for (const book of CATEGORY_PLAYBOOKS) {
+      if (book.keywords.some((word) => hasKeyword(folded, word))) return book;
     }
     return DEFAULT_PLAYBOOK;
   }
@@ -302,90 +300,90 @@
 
   function cheapestChain(chains) {
     if (!chains || chains.length === 0) return 'its main chain';
-    let best = chains[0];
-    let bestCost = gasCostUsd(best);
+    let cheapest = chains[0];
+    let cheapestCost = gasCostUsd(cheapest);
     for (const chain of chains) {
-      const cost = gasCostUsd(chain);
-      if (cost < bestCost) {
-        best = chain;
-        bestCost = cost;
+      const price = gasCostUsd(chain);
+      if (price < cheapestCost) {
+        cheapest = chain;
+        cheapestCost = price;
       }
     }
-    return best;
+    return cheapest;
   }
 
-  function capitalForTvl(tvlUsd) {
-    if (tvlUsd >= 5e9) return 250;
-    if (tvlUsd >= 1e9) return 150;
-    if (tvlUsd >= 1e8) return 100;
+  function capitalForTvl(lockedValue) {
+    if (lockedValue >= 5e9) return 250;
+    if (lockedValue >= 1e9) return 150;
+    if (lockedValue >= 1e8) return 100;
     return 50;
   }
 
-  function holdWindow(ageDays) {
-    if (ageDays === null || ageDays === undefined) return 30;
-    if (ageDays < 180) return 60;
-    if (ageDays < 365) return 45;
+  function holdWindow(ageInDays) {
+    if (ageInDays === null || ageInDays === undefined) return 30;
+    if (ageInDays < 180) return 60;
+    if (ageInDays < 365) return 45;
     return 30;
   }
 
   function gasEstimate(chain) {
-    const cost = gasCostUsd(chain);
-    if (cost >= 8) return 'about $8 of gas';
-    if (cost <= 0.5) return 'about $0.50 of gas';
+    const price = gasCostUsd(chain);
+    if (price >= 8) return 'about $8 of gas';
+    if (price <= 0.5) return 'about $0.50 of gas';
     return 'about $2 of gas';
   }
 
   function firstTxCost(chain) {
-    const cost = gasCostUsd(chain);
-    if (cost >= 8) return 'about $8 of gas for the first transaction';
-    if (cost <= 0.5) return 'under $1 of gas for the first transaction';
+    const price = gasCostUsd(chain);
+    if (price >= 8) return 'about $8 of gas for the first transaction';
+    if (price <= 0.5) return 'under $1 of gas for the first transaction';
     return 'under $3 of gas for the first transaction';
   }
 
   function formatStep(step) {
-    let text = `${step.text} Cost: ${step.cost}. Time: ${step.time}.`;
-    if (text.length > 600) text = `${text.slice(0, 596)}...`;
-    if (text.length < 20) text = `${text} Hold the position and check the protocol's own page.`;
-    return text;
+    let rendered = `${step.text} Cost: ${step.cost}. Time: ${step.time}.`;
+    if (rendered.length > 600) rendered = `${rendered.slice(0, 596)}...`;
+    if (rendered.length < 20) rendered = `${rendered} Hold the position and check the protocol's own page.`;
+    return rendered;
   }
 
   function buildFarmSteps(row) {
-    const chain = cheapestChain(row.chains);
-    const capital = capitalForTvl(row.tvl_usd);
-    const hold = holdWindow(row.age_days);
-    const gas = gasEstimate(chain);
-    const pb = pickPlaybook(row.category);
-    const ctx = { name: row.name, capital, chain };
-    const monthly = gasCostUsd(chain) >= 8;
-    const cadence = monthly ? 'month' : 'week';
-    const weeklyText = pb.weekly(ctx);
-    const recurringText = monthly
-      ? weeklyText
+    const network = cheapestChain(row.chains);
+    const stake = capitalForTvl(row.tvl_usd);
+    const holdDays = holdWindow(row.age_days);
+    const gasText = gasEstimate(network);
+    const book = pickPlaybook(row.category);
+    const ctx = { name: row.name, capital: stake, chain: network };
+    const isMonthly = gasCostUsd(network) >= 8;
+    const period = isMonthly ? 'month' : 'week';
+    const weeklyStep = book.weekly(ctx);
+    const recurringStep = isMonthly
+      ? weeklyStep
           .replace(/once a week/g, 'once a month')
           .replace(/each week/g, 'each month')
           .replace(/a week/g, 'a month')
-      : weeklyText;
+      : weeklyStep;
 
     return [
       {
         text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.',
-        cost: firstTxCost(chain),
+        cost: firstTxCost(network),
         time: '5 minutes',
       },
       {
-        text: pb.setup(ctx),
-        cost: `$${capital} of capital and ${gas}`,
+        text: book.setup(ctx),
+        cost: `$${stake} of capital and ${gasText}`,
         time: '15 minutes to set up',
       },
       {
-        text: recurringText,
-        cost: `${gas} a ${cadence}`,
-        time: `10 minutes a ${cadence}`,
+        text: recurringStep,
+        cost: `${gasText} a ${period}`,
+        time: `10 minutes a ${period}`,
       },
       {
-        text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
-        cost: `the $${capital} stays in the position`,
-        time: `${hold} days`,
+        text: `Hold the position for at least ${holdDays} days so the activity is counted in more than one snapshot.`,
+        cost: `the $${stake} stays in the position`,
+        time: `${holdDays} days`,
       },
       {
         text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.",

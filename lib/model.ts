@@ -1,47 +1,48 @@
-// Token Radar model (radar-3): deterministic scoring, ranking, and farm-plan generation
-// from a single DefiLlama protocol snapshot.
+// Token Radar scoring model (radar-3): deterministic ranking and farm-plan derivation
+// from one sealed DefiLlama protocol snapshot.
 //
-// radar-3 changes over radar-2:
-// - Comparables are aggregated by parent symbol: a token's market cap is divided by the
-//   combined TVL of every protocol carrying that symbol. aave-v2 no longer reads Aave's
-//   whole $1.72B market cap against its $90.9M v2 TVL (18.96x -> 0.11x).
-// - Centralised-exchange, bridge, liquid-staking and liquid-restaking protocols are
-//   excluded from the comparables pool, so they no longer drag the medians.
-// - A category with fewer than 3 comparables no longer falls back to the market-wide
-//   median: it is capped by its family-group median (Vaults & Curators, Lending & CDP,
-//   RWA & Yield), or by the market median when it has no family. A single outlier
-//   (Api3 at 2.97x) can no longer price a whole family, and thin families stop
-//   inheriting the market rate. Veda's category (Onchain Capital Allocator) has two
-//   live peers at 0.0191 and 0.0059, so Veda is now priced near them instead of at
-//   the market rate.
-// - Maturity is no longer "older is better": it peaks in the 6-18 month window when a
-//   launch is most likely, and falls away for very young and very old protocols.
-// - A week's price move is damped (weight 0.3, clamped to -25..+40) so one volatile
-//   week cannot swing a valuation by 1.8x; chains count a little more (0.015 each).
-// - Six sub-protocols whose parent token already trades are removed from the board.
-// - Every row carries a launch/mining signal score (0-100).
+// What radar-3 does differently from radar-2:
+// - Peer ratios are rolled up by parent symbol first: a token's market cap is spread
+//   across the combined TVL of every protocol that carries its symbol. Aave's v2 pool
+//   no longer carries the whole $1.72B Aave cap on $90.9M of v2 TVL (18.96x -> 0.11x).
+// - Centralised exchanges, bridges, liquid-staking and liquid-restaking protocols are
+//   kept out of the peer pool altogether, so they stop pulling the medians down.
+// - A thin category (under 3 peers) no longer inherits the market-wide median: it is
+//   held to the smaller of its own median and its family-group median (Vaults &
+//   Curators, Lending & CDP, RWA & Yield), falling back to the market median only when
+//   it belongs to no family. One outlier (Api3 at 2.97x) can no longer reprice an
+//   entire family, and thin families stop borrowing the market rate. Veda's peers in
+//   Onchain Capital Allocator sit at 0.0191 and 0.0059, so Veda now lands near them
+//   instead of near the market rate.
+// - Age no longer helps monotonically: the multiplier tops out in the 6-18 month band
+//   where a launch is most plausible, and tapers off for the very young and the very
+//   old.
+// - One week's move is muted (weight 0.3, clamped to -25..+40), so a single jumpy
+//   week cannot move a valuation by 1.8x; chain reach counts slightly more (0.015).
+// - Six sub-protocols whose parent token already trades are taken off the board.
+// - Each row now shows a launch/mining signal score (0-100).
 //
-// Scope of the ranked board:
-// - Includes every protocol listed in snapshot.watchlist (the coverage floor).
-// - Adds pre-token protocols below snapshot.floor_usd that pass the watchlist filter.
-// - Fills the board to 178 rows from the largest pre-token protocols above the floor
-//   that are not on the watchlist, so removing a launched sub-protocol does not shrink
-//   the board.
-// - Excludes live-token protocols from the ranking, setting them aside with market caps.
+// Which protocols make the ranked board:
+// - Every protocol on snapshot.watchlist (the coverage floor).
+// - Pre-token protocols under snapshot.floor_usd that clear the watchlist filter.
+// - The board is topped back up to 178 rows from the biggest pre-token protocols
+//   above the floor that are not on the watchlist, so dropping a launched
+//   sub-protocol never shrinks the board.
+// - Live-token protocols stay out of the ranking; they are listed aside with caps.
 //
-// Implied valuation formula (applied uniformly; no protocol name is special-cased):
-//   ratio      = category median (mcap_usd / tvl_usd) for token-bearing protocols with >= 3
-//                comparables, otherwise the smaller of the category median and its
-//                family-group median, otherwise the market-wide median.
-//   growth     = clamp(change_7d ?? 0, -25, +40)
-//   growthMult = 1 + (growth / 100) * 0.3
-//   maturity   = 0.85 + 0.15 * age/180                 (age < 180)
-//              = 1.0                                    (180 <= age <= 540)
-//              = 1.0 - 0.15 * (age-540)/555             (540 < age <= 1095)
-//              = 0.85 - 0.05 * min(1, (age-1095)/1095)  (age > 1095)
-//              = 0.9                                    (age unknown)
-//   chains     = 1 + 0.015 * clamp(chains.length - 1, 0, 10)
-//   implied    = max(1, round(tvl_usd * ratio * growthMult * maturity * chains))
+// Implied valuation (one formula for every row; no protocol name is special-cased):
+//   ratio        = category median (mcap_usd / tvl_usd) across token-bearing peers
+//                  with >= 3 comparables; otherwise the smaller of the category
+//                  median and its family-group median; otherwise the market median.
+//   growth       = clamp(change_7d ?? 0, -25, +40)
+//   growthFactor = 1 + (growth / 100) * 0.3
+//   maturity     = 0.85 + 0.15 * age/180                 (age < 180)
+//                = 1.0                                    (180 <= age <= 540)
+//                = 1.0 - 0.15 * (age-540)/555             (540 < age <= 1095)
+//                = 0.85 - 0.05 * min(1, (age-1095)/1095)  (age > 1095)
+//                = 0.9                                    (age unknown)
+//   chains       = 1 + 0.015 * clamp(chains.length - 1, 0, 10)
+//   implied      = max(1, round(tvl_usd * ratio * growthFactor * maturity * chains))
 
 // ---------------------------------------------------------------------------
 // Public data structures
@@ -325,196 +326,189 @@ const MAX_STEPS_PER_ROW = 12;
 // Generic math & comparison helpers
 // ---------------------------------------------------------------------------
 
-function clamp(value: number, low: number, high: number): number {
-  return Math.min(high, Math.max(low, value));
+function clamp(amount: number, floor: number, ceiling: number): number {
+  return Math.min(ceiling, Math.max(floor, amount));
 }
 
-function finiteOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+function finiteOr(candidate: unknown, fallback: number): number {
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : fallback;
 }
 
-function compareLex(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+function compareLex(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function roundTo4(value: number): number {
-  return Math.round(value * 1e4) / 1e4;
+function roundTo4(amount: number): number {
+  return Math.round(amount * 1e4) / 1e4;
 }
 
-function computeMedian(values: number[]): number | null {
-  if (values.length === 0) return null;
-  const sorted = values.slice().sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1
-    ? sorted[mid]!
-    : (sorted[mid - 1]! + sorted[mid]!) / 2;
+function computeMedian(samples: number[]): number | null {
+  if (samples.length === 0) return null;
+  const ordered = samples.slice().sort((a, b) => a - b);
+  const middle = Math.floor(ordered.length / 2);
+  return ordered.length % 2 === 1
+    ? ordered[middle]!
+    : (ordered[middle - 1]! + ordered[middle]!) / 2;
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function isPlainRecord(candidate: unknown): candidate is Record<string, unknown> {
+  return typeof candidate === 'object' && candidate !== null && !Array.isArray(candidate);
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function escapeRegExp(pattern: string): string {
+  return pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** True when `text` contains `keyword` as a whole word or phrase (not as a substring). */
-function hasKeyword(text: string, keyword: string): boolean {
-  return new RegExp(`\\b${escapeRegExp(keyword)}`, 'i').test(text);
+/** True when `haystack` holds `needle` as a whole word or phrase (never as a substring). */
+function hasKeyword(haystack: string, needle: string): boolean {
+  return new RegExp(`\\b${escapeRegExp(needle)}`, 'i').test(haystack);
 }
 
 // ---------------------------------------------------------------------------
 // Valuation & comparables
 // ---------------------------------------------------------------------------
 
-/** Whole days elapsed from `listedAt` to `asOf` (clamped at 0), or null if unavailable/invalid. */
+/** Whole days from `listedAt` to `asOf` (floored at 0), or null when missing or invalid. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
-  const endMs = Date.parse(`${asOf}T00:00:00Z`);
-  const startMs = Date.parse(`${listedAt}T00:00:00Z`);
-  if (!Number.isFinite(endMs) || !Number.isFinite(startMs)) return null;
-  return Math.max(0, Math.floor((endMs - startMs) / MS_PER_DAY));
+  const asOfMs = Date.parse(`${asOf}T00:00:00Z`);
+  const listedMs = Date.parse(`${listedAt}T00:00:00Z`);
+  if (!Number.isFinite(asOfMs) || !Number.isFinite(listedMs)) return null;
+  return Math.max(0, Math.floor((asOfMs - listedMs) / MS_PER_DAY));
 }
 
-/** The family a category belongs to, or null when it has none. */
+/** The family a category sits in, or null when it belongs to none. */
 export function familyOf(category: string | null): string | null {
   if (category === null) return null;
-  for (const [family, members] of CATEGORY_FAMILIES) {
-    if (members.includes(category)) return family;
+  for (const [family, memberList] of CATEGORY_FAMILIES) {
+    if (memberList.includes(category)) return family;
   }
   return null;
 }
 
+/** Collects one value into a map of arrays, creating the array on first use. */
+function addToBucket(buckets: Map<string, number[]>, key: string, value: number): void {
+  const slot = buckets.get(key);
+  if (slot === undefined) {
+    buckets.set(key, [value]);
+  } else {
+    slot.push(value);
+  }
+}
+
 /**
- * Computes median mcap/TVL comparables from the token-bearing protocols in the snapshot.
- * Ratios are aggregated by parent symbol first: a token's market cap is divided by the
- * combined TVL of every protocol carrying that symbol, so a parent token's cap is never
- * read against one sub-protocol's TVL. Centralised-exchange, bridge, liquid-staking
- * and liquid-restaking protocols are excluded from the pool entirely.
- * Categories with fewer than `min` comparables are omitted from byCategory; their
- * family-group medians are computed from the same pool.
+ * Builds median mcap/TVL peer ratios from the snapshot's token-bearing protocols.
+ * Each token's cap is first spread over the combined TVL of every protocol that
+ * carries its symbol, so a parent token's cap is never read against a single
+ * sub-protocol's TVL. Centralised exchanges, bridges, liquid-staking and
+ * liquid-restaking protocols stay out of the pool entirely.
+ * Categories under `min` peers are left out of byCategory; their family-group
+ * medians come from the same pool.
  */
 export function comparables(snapshot: Snapshot): ComparableTable {
-  const symbolTvl = new Map<string, number>();
-  const symbolMcap = new Map<string, number>();
-  const symbolCategory = new Map<string, string | null>();
+  const tvlBySymbol = new Map<string, number>();
+  const capBySymbol = new Map<string, number>();
+  const categoryBySymbol = new Map<string, string | null>();
 
-  for (const protocol of snapshot.protocols) {
-    const symbol = protocol.symbol;
-    if (symbol === null) continue;
-    symbolTvl.set(symbol, (symbolTvl.get(symbol) ?? 0) + (protocol.tvl_usd > 0 ? protocol.tvl_usd : 0));
-    if (
-      protocol.mcap_usd !== null &&
-      protocol.gecko_id !== null &&
-      protocol.mcap_usd > 0
-    ) {
-      const prev = symbolMcap.get(symbol);
-      if (prev === undefined || protocol.mcap_usd > prev) {
-        symbolMcap.set(symbol, protocol.mcap_usd);
-        symbolCategory.set(symbol, protocol.category);
+  for (const entry of snapshot.protocols) {
+    const ticker = entry.symbol;
+    if (ticker === null) continue;
+    tvlBySymbol.set(ticker, (tvlBySymbol.get(ticker) ?? 0) + (entry.tvl_usd > 0 ? entry.tvl_usd : 0));
+    if (entry.mcap_usd !== null && entry.gecko_id !== null && entry.mcap_usd > 0) {
+      const held = capBySymbol.get(ticker);
+      if (held === undefined || entry.mcap_usd > held) {
+        capBySymbol.set(ticker, entry.mcap_usd);
+        categoryBySymbol.set(ticker, entry.category);
       }
     }
   }
 
-  const categoryBuckets = new Map<string, number[]>();
-  const familyBuckets = new Map<string, number[]>();
-  const allRatios: number[] = [];
+  const bucketsByCategory = new Map<string, number[]>();
+  const bucketsByFamily = new Map<string, number[]>();
+  const peerRatios: number[] = [];
 
-  for (const [symbol, mcap] of symbolMcap) {
-    const category = symbolCategory.get(symbol) ?? null;
+  for (const [ticker, cap] of capBySymbol) {
+    const category = categoryBySymbol.get(ticker) ?? null;
     if (category !== null && EXCLUDED_CATEGORIES.has(category)) continue;
-    const tvl = symbolTvl.get(symbol) ?? 0;
+    const tvl = tvlBySymbol.get(ticker) ?? 0;
     if (!(tvl > 0)) continue;
 
-    const ratio = mcap / tvl;
-    allRatios.push(ratio);
+    const peerRatio = cap / tvl;
+    peerRatios.push(peerRatio);
 
     if (category !== null) {
-      let bucket = categoryBuckets.get(category);
-      if (bucket === undefined) {
-        bucket = [];
-        categoryBuckets.set(category, bucket);
-      }
-      bucket.push(ratio);
-
+      addToBucket(bucketsByCategory, category, peerRatio);
       const family = familyOf(category);
-      if (family !== null) {
-        let familyBucket = familyBuckets.get(family);
-        if (familyBucket === undefined) {
-          familyBucket = [];
-          familyBuckets.set(family, familyBucket);
-        }
-        familyBucket.push(ratio);
-      }
+      if (family !== null) addToBucket(bucketsByFamily, family, peerRatio);
     }
   }
 
-  const global = computeMedian(allRatios) ?? FALLBACK_GLOBAL_RATIO;
+  const marketMedian = computeMedian(peerRatios) ?? FALLBACK_GLOBAL_RATIO;
   const byCategory = new Map<string, CategoryComparable>();
-  for (const [category, ratios] of categoryBuckets) {
-    const med = computeMedian(ratios);
-    if (med !== null) {
-      byCategory.set(category, { ratio: med, n: ratios.length });
+  for (const [category, ratios] of bucketsByCategory) {
+    const medianValue = computeMedian(ratios);
+    if (medianValue !== null) {
+      byCategory.set(category, { ratio: medianValue, n: ratios.length });
     }
   }
 
   const byGroup = new Map<string, number>();
-  for (const [family, ratios] of familyBuckets) {
-    const med = computeMedian(ratios);
-    if (med !== null) byGroup.set(family, med);
+  for (const [family, ratios] of bucketsByFamily) {
+    const medianValue = computeMedian(ratios);
+    if (medianValue !== null) byGroup.set(family, medianValue);
   }
 
-  return { byCategory, byGroup, global };
+  return { byCategory, byGroup, global: marketMedian };
 }
 
 /**
- * Resolves the comparable ratio and provenance for a single protocol.
- * A category with at least `min` comparables uses its own median. A thin category
- * uses the smaller of its own median and its family median, so one outlier (Api3
- * at 2.97x in Risk Curators) cannot inflate it, while a category whose own peers
- * are genuinely cheap (Onchain Capital Allocator at 0.0125) keeps its own level.
- * A category with no comparables uses its family median, or the market-wide median
- * when it has no family.
+ * Picks the peer ratio and its provenance for one protocol.
+ * A category with at least `min` peers stands on its own median. A thin category
+ * is held to the smaller of its own median and its family median, so a single
+ * outlier (Api3 at 2.97x in Risk Curators) cannot lift it, while a category whose
+ * own peers are genuinely cheap (Onchain Capital Allocator at 0.0125) keeps its
+ * own level. A category with no peers at all takes its family median, or the
+ * market-wide median when it belongs to no family.
  */
 export function ratioFor(
-  p: SnapshotProtocol,
+  protocol: SnapshotProtocol,
   table: ComparableTable,
   min: number,
 ): { ratio: number; n: number; source: string } {
-  const catStats = p.category === null ? undefined : table.byCategory.get(p.category);
-  if (catStats !== undefined && catStats.n >= min) {
+  const categoryStats = protocol.category === null ? undefined : table.byCategory.get(protocol.category);
+  if (categoryStats !== undefined && categoryStats.n >= min) {
     return {
-      ratio: catStats.ratio,
-      n: catStats.n,
-      source: `${p.category} median`,
+      ratio: categoryStats.ratio,
+      n: categoryStats.n,
+      source: `${protocol.category} median`,
     };
   }
 
-  const family = familyOf(p.category);
-  const familyMedian = family === null ? undefined : table.byGroup.get(family);
-  const cap = familyMedian !== undefined ? familyMedian : table.global;
-  const capName = familyMedian !== undefined ? `${family} median` : 'market-wide median';
+  const family = familyOf(protocol.category);
+  const familyRate = family === null ? undefined : table.byGroup.get(family);
+  const ceiling = familyRate !== undefined ? familyRate : table.global;
+  const ceilingLabel = familyRate !== undefined ? `${family} median` : 'market-wide median';
 
-  if (catStats !== undefined) {
+  if (categoryStats !== undefined) {
     return {
-      ratio: Math.min(catStats.ratio, cap),
-      n: catStats.n,
-      source: `${p.category} median capped by ${capName}`,
+      ratio: Math.min(categoryStats.ratio, ceiling),
+      n: categoryStats.n,
+      source: `${protocol.category} median capped by ${ceilingLabel}`,
     };
   }
-  if (familyMedian !== undefined) {
-    return { ratio: familyMedian, n: 0, source: `${family} median` };
+  if (familyRate !== undefined) {
+    return { ratio: familyRate, n: 0, source: `${family} median` };
   }
   return { ratio: table.global, n: 0, source: 'market-wide median' };
 }
 
 /**
- * The maturity multiplier: it peaks in the 6-18 month window when a token launch is
- * most likely, and falls away for very young protocols (unproven) and very old ones
- * (a protocol that has run for years with no token is less likely to launch one).
- * A `listed_at` shared by a whole category (DefiLlama's tracking start, not the
- * protocol's age) is treated like any other date: the curve is flat across the
- * sweet spot, so the cluster earns no artificial boost.
+ * The maturity factor: it tops out in the 6-18 month band where a token launch is
+ * most plausible, and tapers off for very young protocols (unproven) and very old
+ * ones (a protocol that has run for years with no token is less likely to launch
+ * one). A `listed_at` shared by a whole category (DefiLlama's tracking start, not
+ * the protocol's age) is handled like any other date: the curve stays flat across
+ * the sweet spot, so the cluster picks up no artificial lift.
  */
 export function maturityMultiplier(age: number | null, model: ModelConstants): number {
   if (age === null) return model.unknown_maturity;
@@ -526,43 +520,41 @@ export function maturityMultiplier(age: number | null, model: ModelConstants): n
   }
   if (age <= model.maturity_sweet_end) return model.maturity_peak;
   if (age <= model.maturity_decline_end) {
-    const span = model.maturity_decline_end - model.maturity_sweet_end;
-    return (
-      model.maturity_peak -
-      (model.maturity_peak - model.maturity_young_floor) * ((age - model.maturity_sweet_end) / span)
-    );
+    const declineSpan = model.maturity_decline_end - model.maturity_sweet_end;
+    const fallShare = (age - model.maturity_sweet_end) / declineSpan;
+    return model.maturity_peak - (model.maturity_peak - model.maturity_young_floor) * fallShare;
   }
-  const over = Math.min(1, (age - model.maturity_decline_end) / model.maturity_decline_end);
-  return model.maturity_young_floor - (model.maturity_young_floor - model.maturity_old_floor) * over;
+  const beyondShare = Math.min(1, (age - model.maturity_decline_end) / model.maturity_decline_end);
+  return model.maturity_young_floor - (model.maturity_young_floor - model.maturity_old_floor) * beyondShare;
 }
 
 /**
  * A 0-100 launch/mining signal: how attractive this protocol is to farm right now.
- * Age in the 6-18 month sweet spot, positive momentum, many chains, and a category
- * whose tokens have actually launched all raise it.
+ * An age inside the 6-18 month sweet spot, rising momentum, wide chain reach, and
+ * a category whose tokens have actually launched all push it up.
  */
 export function signalScore(
   protocol: SnapshotProtocol,
   age: number | null,
   ratioN: number,
 ): number {
-  let ageScore: number;
-  if (age === null) ageScore = 50;
-  else if (age >= 180 && age <= 540) ageScore = 100;
-  else if ((age >= 90 && age < 180) || (age > 540 && age <= 1095)) ageScore = 70;
-  else if (age < 90) ageScore = 40;
-  else ageScore = 30;
+  let agePoints: number;
+  if (age === null) agePoints = 50;
+  else if (age >= 180 && age <= 540) agePoints = 100;
+  else if ((age >= 90 && age < 180) || (age > 540 && age <= 1095)) agePoints = 70;
+  else if (age < 90) agePoints = 40;
+  else agePoints = 30;
 
-  const growthScore = clamp(50 + finiteOr(protocol.change_7d, 0), 0, 100);
-  const chainScore = Math.min(100, protocol.chains.length * 10);
-  const categoryScore = ratioN >= 3 ? 80 : ratioN >= 1 ? 50 : 30;
+  const momentumPoints = clamp(50 + finiteOr(protocol.change_7d, 0), 0, 100);
+  const reachPoints = Math.min(100, protocol.chains.length * 10);
+  const evidencePoints = ratioN >= 3 ? 80 : ratioN >= 1 ? 50 : 30;
 
   return Math.round(
-    0.35 * ageScore + 0.25 * growthScore + 0.15 * chainScore + 0.25 * categoryScore,
+    0.35 * agePoints + 0.25 * momentumPoints + 0.15 * reachPoints + 0.25 * evidencePoints,
   );
 }
 
-/** Evaluates all multipliers and the final implied USD valuation for one protocol. */
+/** Works out every factor and the final implied USD valuation for one protocol. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
@@ -570,31 +562,31 @@ export function impliedValue(
   table: ComparableTable,
 ): ValuationResult {
   const age = ageDays(asOf, protocol.listed_at);
-  const { ratio, n: ratioN, source: ratioSource } = ratioFor(protocol, table, model.min_comparables);
+  const { ratio, n: peerCount, source: peerSource } = ratioFor(protocol, table, model.min_comparables);
 
-  const rawGrowth = finiteOr(protocol.change_7d, 0);
-  const growthPct = clamp(rawGrowth, model.growth_floor, model.growth_cap);
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const weeklyMove = finiteOr(protocol.change_7d, 0);
+  const clampedMove = clamp(weeklyMove, model.growth_floor, model.growth_cap);
+  const growthFactor = 1 + (clampedMove / 100) * model.growth_weight;
 
-  const maturityMult = maturityMultiplier(age, model);
+  const maturityFactor = maturityMultiplier(age, model);
 
-  const extraChains = clamp(protocol.chains.length - 1, 0, model.chain_cap);
-  const chainMult = 1 + model.chain_step * extraChains;
+  const extraChainCount = clamp(protocol.chains.length - 1, 0, model.chain_cap);
+  const chainFactor = 1 + model.chain_step * extraChainCount;
 
-  const rawImplied = protocol.tvl_usd * ratio * growthMult * maturityMult * chainMult;
-  const implied = Math.max(1, Math.round(rawImplied));
+  const rawValue = protocol.tvl_usd * ratio * growthFactor * maturityFactor * chainFactor;
+  const implied = Math.max(1, Math.round(rawValue));
 
   return {
     implied,
     ratio,
-    ratioN,
-    ratioSource,
-    growthPct,
-    growthMult,
-    maturityMult,
-    chainMult,
+    ratioN: peerCount,
+    ratioSource: peerSource,
+    growthPct: clampedMove,
+    growthMult: growthFactor,
+    maturityMult: maturityFactor,
+    chainMult: chainFactor,
     age,
-    signal: signalScore(protocol, age, ratioN),
+    signal: signalScore(protocol, age, peerCount),
   };
 }
 
@@ -602,24 +594,24 @@ export function impliedValue(
 // Pre-token & eligibility rules
 // ---------------------------------------------------------------------------
 
-/** True when the snapshot records no market cap, CoinGecko id, or symbol. */
-export function isPreToken(p: SnapshotProtocol): boolean {
-  return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
+/** True when the snapshot shows no market cap, CoinGecko id, or symbol for it. */
+export function isPreToken(protocol: SnapshotProtocol): boolean {
+  return protocol.mcap_usd === null && protocol.gecko_id === null && protocol.symbol === null;
 }
 
 /**
- * True when a protocol qualifies for the pre-token radar under the watchlist rule:
- * pre-token, not a launched sub-protocol, not in an excluded derivative/bridge/CEX
- * category, not version-suffixed, not named as wrapped/staked/staking, and not
- * prefixed with a major exchange name.
+ * True when a protocol belongs on the pre-token radar under the watchlist rule:
+ * pre-token, not a launched sub-protocol, outside the excluded derivative, bridge
+ * and CEX categories, without a version suffix, not named as wrapped, staked or
+ * staking, and not prefixed with a major exchange name.
  */
-export function isRankable(p: SnapshotProtocol): boolean {
-  if (!isPreToken(p)) return false;
-  if (LAUNCHED_SUBPROTOCOLS.has(p.slug)) return false;
-  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
-  if (VERSION_SUFFIX_RE.test(p.name)) return false;
-  if (DERIVATIVE_WORD_RE.test(p.name)) return false;
-  if (EXCHANGE_PREFIXES.some((prefix) => p.name.startsWith(prefix))) return false;
+export function isRankable(protocol: SnapshotProtocol): boolean {
+  if (!isPreToken(protocol)) return false;
+  if (LAUNCHED_SUBPROTOCOLS.has(protocol.slug)) return false;
+  if (protocol.category !== null && EXCLUDED_CATEGORIES.has(protocol.category)) return false;
+  if (VERSION_SUFFIX_RE.test(protocol.name)) return false;
+  if (DERIVATIVE_WORD_RE.test(protocol.name)) return false;
+  if (EXCHANGE_PREFIXES.some((brand) => protocol.name.startsWith(brand))) return false;
   return true;
 }
 
@@ -785,18 +777,18 @@ const DEFAULT_PLAYBOOK: CategoryPlaybook = {
     'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.',
 };
 
-/** Matches a category against the playbooks on whole words, so "Indexes" never matches "dex". */
+/** Picks a playbook by matching the category on whole words, so "Indexes" never matches "dex". */
 function selectPlaybook(category: string | null): CategoryPlaybook {
-  const normalized = (category ?? '').toLowerCase();
+  const folded = (category ?? '').toLowerCase();
   for (const playbook of CATEGORY_PLAYBOOKS) {
-    if (playbook.keywords.some((kw) => hasKeyword(normalized, kw))) {
+    if (playbook.keywords.some((word) => hasKeyword(folded, word))) {
       return playbook;
     }
   }
   return DEFAULT_PLAYBOOK;
 }
 
-/** The gas cost of one transaction on a chain, in dollars. */
+/** What one transaction costs in gas on a chain, in dollars. */
 export function gasCostUsd(chain: string): number {
   if (chain === 'Ethereum') return 8;
   if (LOW_GAS_CHAINS.has(chain)) return 0.5;
@@ -806,56 +798,56 @@ export function gasCostUsd(chain: string): number {
 /** The cheapest chain a protocol runs on (first listed wins a tie), or its main chain. */
 export function cheapestChain(protocol: SnapshotProtocol): string {
   if (protocol.chains.length === 0) return 'its main chain';
-  let best = protocol.chains[0]!;
-  let bestCost = gasCostUsd(best);
+  let cheapest = protocol.chains[0]!;
+  let cheapestCost = gasCostUsd(cheapest);
   for (const chain of protocol.chains) {
-    const cost = gasCostUsd(chain);
-    if (cost < bestCost) {
-      best = chain;
-      bestCost = cost;
+    const price = gasCostUsd(chain);
+    if (price < cheapestCost) {
+      cheapest = chain;
+      cheapestCost = price;
     }
   }
-  return best;
+  return cheapest;
 }
 
-function suggestedCapital(tvlUsd: number): number {
-  if (tvlUsd >= 5_000_000_000) return 250;
-  if (tvlUsd >= 1_000_000_000) return 150;
-  if (tvlUsd >= 100_000_000) return 100;
+function suggestedCapital(lockedValue: number): number {
+  if (lockedValue >= 5_000_000_000) return 250;
+  if (lockedValue >= 1_000_000_000) return 150;
+  if (lockedValue >= 100_000_000) return 100;
   return 50;
 }
 
-function holdWindowDays(age: number | null): number {
-  if (age === null) return 30;
-  if (age < 180) return 60;
-  if (age < 365) return 45;
+function holdWindowDays(ageInDays: number | null): number {
+  if (ageInDays === null) return 30;
+  if (ageInDays < 180) return 60;
+  if (ageInDays < 365) return 45;
   return 30;
 }
 
 function estimatedGas(chain: string): string {
-  const cost = gasCostUsd(chain);
-  if (cost >= 8) return 'about $8 of gas';
-  if (cost <= 0.5) return 'about $0.50 of gas';
+  const price = gasCostUsd(chain);
+  if (price >= 8) return 'about $8 of gas';
+  if (price <= 0.5) return 'about $0.50 of gas';
   return 'about $2 of gas';
 }
 
 function firstTxCost(chain: string): string {
-  const cost = gasCostUsd(chain);
-  if (cost >= 8) return 'about $8 of gas for the first transaction';
-  if (cost <= 0.5) return 'under $1 of gas for the first transaction';
+  const price = gasCostUsd(chain);
+  if (price >= 8) return 'about $8 of gas for the first transaction';
+  if (price <= 0.5) return 'under $1 of gas for the first transaction';
   return 'under $3 of gas for the first transaction';
 }
 
-/** Formats one structured FarmStep into a gate-compliant 20..600 character string. */
+/** Renders one structured FarmStep as a gate-compliant 20..600 character string. */
 export function stepText(step: FarmStep): string {
-  let formatted = `${step.text} Cost: ${step.cost}. Time: ${step.time}.`;
-  if (formatted.length > MAX_STEP_CHARS) {
-    formatted = `${formatted.slice(0, MAX_STEP_CHARS - 4)}...`;
+  let rendered = `${step.text} Cost: ${step.cost}. Time: ${step.time}.`;
+  if (rendered.length > MAX_STEP_CHARS) {
+    rendered = `${rendered.slice(0, MAX_STEP_CHARS - 4)}...`;
   }
-  if (formatted.length < MIN_STEP_CHARS) {
-    formatted = `${formatted} Hold the position and check the protocol's own page.`;
+  if (rendered.length < MIN_STEP_CHARS) {
+    rendered = `${rendered} Hold the position and check the protocol's own page.`;
   }
-  return formatted;
+  return rendered;
 }
 
 /**
