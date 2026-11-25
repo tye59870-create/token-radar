@@ -1,7 +1,7 @@
 // Token Radar's entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every pre-token
-// protocol with the radar-2 model in lib/model.ts, writes the ranked board to /output/board.json, the
+// protocol with the radar-3 model in lib/model.ts, writes the ranked board to /output/board.json, the
 // dashboard's data to /output/data.js, decodes the base64 screenshots in screenshots/ into whole PNGs
 // in /output/screenshots, and copies this repository's dashboard/ to /output. Last it writes
 // /output/dossier.json, the summary the judge reads, with the vendored make.fun library.
@@ -93,7 +93,7 @@ for (const name of shotNames) {
   shots.push(pngName);
 }
 if (shots.length < 3) {
-  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
+  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3 or 4, the board, a detail view, a filtered view and the live view\n`);
   process.exit(1);
 }
 

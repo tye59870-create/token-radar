@@ -1,6 +1,6 @@
-// Token Radar dashboard client (radar-2).
-// Renders the offline board, filters, sorting, methodology panel, and protocol detail drawer
-// directly from window.RADAR (loaded via ../data.js).
+// Token Radar dashboard client (radar-3).
+// Renders the offline board, filters, sorting, charts, methodology panel, and protocol
+// detail drawer directly from window.RADAR (loaded via ../data.js).
 (() => {
   'use strict';
 
@@ -10,9 +10,12 @@
 
   const WATCHLIST_SLUGS = new Set(DATA.watchlist || []);
   const LOW_GAS_CHAINS = new Set([
-    'Base', 'Arbitrum', 'Optimism', 'Solana', 'Polygon', 'BSC', 'BNB Chain',
-    'Avalanche', 'Blast', 'Linea', 'Scroll', 'zkSync Era', 'Mode', 'Sonic',
-    'Plasma', 'Hyperliquid', 'Sui', 'Aptos',
+    'Base', 'Arbitrum', 'Optimism', 'Solana', 'Polygon', 'BSC', 'BNB Chain', 'Binance',
+    'Avalanche', 'Blast', 'Linea', 'Scroll', 'zkSync Era', 'Mode', 'Sonic', 'Plasma',
+    'Hyperliquid', 'Hyperliquid L1', 'Sui', 'Aptos', 'Monad', 'Stellar', 'Ink', 'Tron',
+    'Mantle', 'Starknet', 'Stable', 'Robinhood Chain', 'Katana', 'Arc', 'Tempo', 'BOB',
+    'Plume Mainnet', 'Fluent', 'Citrea', 'Mezo', 'Corn', 'Morph', 'Proton', 'Ripple',
+    'Kava', 'Flare', 'Berachain', 'Unichain', 'Sei', 'Soneium', 'World Chain', 'Zora',
   ]);
 
   const state = {
@@ -23,6 +26,8 @@
     tab: 'pre-token',
     sort: 'implied',
     dir: -1,
+    liveSort: 'mcap',
+    liveDir: -1,
     selected: null,
   };
 
@@ -66,6 +71,14 @@
     return maxCount ? chains.slice(0, maxCount).join(', ') : chains.join(', ');
   }
 
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   // -------------------------------------------------------------------------
   // DOM builder
   // -------------------------------------------------------------------------
@@ -107,27 +120,94 @@
     return Math.min(high, Math.max(low, value));
   }
 
+  function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function hasKeyword(text, keyword) {
+    return new RegExp(`\\b${escapeRegExp(keyword)}`, 'i').test(text);
+  }
+
+  function maturityMultiplier(age, model) {
+    if (age === null || age === undefined) return model.unknown_maturity;
+    if (age < model.maturity_sweet_start) {
+      return (
+        model.maturity_young_floor +
+        (model.maturity_peak - model.maturity_young_floor) * (age / model.maturity_sweet_start)
+      );
+    }
+    if (age <= model.maturity_sweet_end) return model.maturity_peak;
+    if (age <= model.maturity_decline_end) {
+      const span = model.maturity_decline_end - model.maturity_sweet_end;
+      return (
+        model.maturity_peak -
+        (model.maturity_peak - model.maturity_young_floor) * ((age - model.maturity_sweet_end) / span)
+      );
+    }
+    const over = Math.min(1, (age - model.maturity_decline_end) / model.maturity_decline_end);
+    return model.maturity_young_floor - (model.maturity_young_floor - model.maturity_old_floor) * over;
+  }
+
   function recomputeImplied(row, model) {
     const rawGrowth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
     const growth = clamp(rawGrowth, model.growth_floor, model.growth_cap);
     const growthMult = 1 + (growth / 100) * model.growth_weight;
-
-    const rawAge = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    const maturityMult =
-      model.maturity_floor +
-      (clamp(rawAge, 0, model.maturity_days) / model.maturity_days) * model.maturity_range;
-
+    const rawAge = row.age_days === null || row.age_days === undefined ? null : row.age_days;
+    const maturityMult = maturityMultiplier(rawAge, model);
     const chainCount = Array.isArray(row.chains) ? row.chains.length : 0;
     const chainMult = 1 + model.chain_step * clamp(chainCount - 1, 0, model.chain_cap);
-
     return Math.max(1, Math.round(row.tvl_usd * row.ratio * growthMult * maturityMult * chainMult));
+  }
+
+  function signalScore(row) {
+    const age = row.age_days;
+    let ageScore;
+    if (age === null || age === undefined) ageScore = 50;
+    else if (age >= 180 && age <= 540) ageScore = 100;
+    else if ((age >= 90 && age < 180) || (age > 540 && age <= 1095)) ageScore = 70;
+    else if (age < 90) ageScore = 40;
+    else ageScore = 30;
+    const growthScore = clamp(50 + (row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d), 0, 100);
+    const chainScore = Math.min(100, (Array.isArray(row.chains) ? row.chains.length : 0) * 10);
+    const categoryScore = row.ratio_n >= 3 ? 80 : row.ratio_n >= 1 ? 50 : 30;
+    return Math.round(0.35 * ageScore + 0.25 * growthScore + 0.15 * chainScore + 0.25 * categoryScore);
   }
 
   const CATEGORY_PLAYBOOKS = [
     {
+      keywords: ['collateral markets'],
+      setup: (c) => `Supply $${c.capital} of collateral assets through ${c.name} on ${c.chain} and keep the position open.`,
+      weekly: (c) => `Top up the collateral or move it between ${c.name} markets once a week so the wallet shows fresh activity.`,
+    },
+    {
       keywords: ['curator', 'allocator'],
       setup: (c) => `Deposit $${c.capital} into a ${c.name} vault on ${c.chain} and keep the vault shares in the same wallet.`,
       weekly: (c) => `Top up the vault or move between ${c.name} vaults once a week so the wallet shows fresh activity.`,
+    },
+    {
+      keywords: ['indexes'],
+      setup: (c) => `Buy $${c.capital} of the index token through ${c.name} on ${c.chain} and hold it in the same wallet.`,
+      weekly: (c) => `Rebalance or top up the ${c.name} index position once a week.`,
+    },
+    {
+      keywords: ['liquidity manager'],
+      setup: (c) => `Deposit $${c.capital} into a ${c.name} managed liquidity position on ${c.chain} and keep it open.`,
+      weekly: (c) => `Rebalance the ${c.name} position once a week.`,
+    },
+    {
+      keywords: ['cedefi'],
+      setup: (c) => `Deposit $${c.capital} into the ${c.name} CeDeFi vault on ${c.chain} and keep the position open.`,
+      weekly: (c) => `Top up or rebalance the ${c.name} vault once a week.`,
+    },
+    {
+      keywords: ['anchor btc'],
+      setup: (c) => `Deposit $${c.capital} of BTC-backed collateral through ${c.name} on ${c.chain} and keep the position open.`,
+      weekly: (c) => `Top up the ${c.name} position once a week.`,
+    },
+    {
+      keywords: ['crypto card', 'card issuer'],
+      setup: (c) => `Order the card from ${c.name}, load $${c.capital} onto it and spend from it.`,
+      weekly: (c) => `Make one card payment through ${c.name} each week.`,
     },
     {
       keywords: ['rwa'],
@@ -209,9 +289,29 @@
   function pickPlaybook(category) {
     const normalized = (category || '').toLowerCase();
     for (const pb of CATEGORY_PLAYBOOKS) {
-      if (pb.keywords.some((kw) => normalized.includes(kw))) return pb;
+      if (pb.keywords.some((kw) => hasKeyword(normalized, kw))) return pb;
     }
     return DEFAULT_PLAYBOOK;
+  }
+
+  function gasCostUsd(chain) {
+    if (chain === 'Ethereum') return 8;
+    if (LOW_GAS_CHAINS.has(chain)) return 0.5;
+    return 2;
+  }
+
+  function cheapestChain(chains) {
+    if (!chains || chains.length === 0) return 'its main chain';
+    let best = chains[0];
+    let bestCost = gasCostUsd(best);
+    for (const chain of chains) {
+      const cost = gasCostUsd(chain);
+      if (cost < bestCost) {
+        best = chain;
+        bestCost = cost;
+      }
+    }
+    return best;
   }
 
   function capitalForTvl(tvlUsd) {
@@ -229,9 +329,17 @@
   }
 
   function gasEstimate(chain) {
-    if (chain === 'Ethereum') return 'about $8 of gas';
-    if (LOW_GAS_CHAINS.has(chain)) return 'about $0.50 of gas';
+    const cost = gasCostUsd(chain);
+    if (cost >= 8) return 'about $8 of gas';
+    if (cost <= 0.5) return 'about $0.50 of gas';
     return 'about $2 of gas';
+  }
+
+  function firstTxCost(chain) {
+    const cost = gasCostUsd(chain);
+    if (cost >= 8) return 'about $8 of gas for the first transaction';
+    if (cost <= 0.5) return 'under $1 of gas for the first transaction';
+    return 'under $3 of gas for the first transaction';
   }
 
   function formatStep(step) {
@@ -242,17 +350,26 @@
   }
 
   function buildFarmSteps(row) {
-    const chain = row.chains && row.chains.length > 0 ? row.chains[0] : 'its main chain';
+    const chain = cheapestChain(row.chains);
     const capital = capitalForTvl(row.tvl_usd);
     const hold = holdWindow(row.age_days);
     const gas = gasEstimate(chain);
     const pb = pickPlaybook(row.category);
     const ctx = { name: row.name, capital, chain };
+    const monthly = gasCostUsd(chain) >= 8;
+    const cadence = monthly ? 'month' : 'week';
+    const weeklyText = pb.weekly(ctx);
+    const recurringText = monthly
+      ? weeklyText
+          .replace(/once a week/g, 'once a month')
+          .replace(/each week/g, 'each month')
+          .replace(/a week/g, 'a month')
+      : weeklyText;
 
     return [
       {
         text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.',
-        cost: 'under $3 of gas for the first transaction',
+        cost: firstTxCost(chain),
         time: '5 minutes',
       },
       {
@@ -261,9 +378,9 @@
         time: '15 minutes to set up',
       },
       {
-        text: pb.weekly(ctx),
-        cost: `${gas} a week`,
-        time: '10 minutes a week',
+        text: recurringText,
+        cost: `${gas} a ${cadence}`,
+        time: `10 minutes a ${cadence}`,
       },
       {
         text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
@@ -320,22 +437,34 @@
   // Filtering & sorting
   // -------------------------------------------------------------------------
 
-  function getFilteredRows() {
+  function rowCategory(row) {
+    return row.category || 'Other';
+  }
+
+  function matchesFilters(row, forLive) {
+    if (!forLive && state.watchlistOnly && !WATCHLIST_SLUGS.has(row.slug)) return false;
+    if (state.category !== 'all' && rowCategory(row) !== state.category) return false;
+    if (state.chain !== 'all' && !(row.chains || []).includes(state.chain)) return false;
     const query = state.q.trim().toLowerCase();
-    return DATA.rows.filter((row) => {
-      if (state.watchlistOnly && !WATCHLIST_SLUGS.has(row.slug)) return false;
-      if (state.category !== 'all' && row.category !== state.category) return false;
-      if (state.chain !== 'all' && !(row.chains || []).includes(state.chain)) return false;
-      if (!query) return true;
-      const searchable = [row.name, row.slug, row.category, (row.chains || []).join(' ')]
-        .join(' ')
-        .toLowerCase();
-      return searchable.includes(query);
-    });
+    if (!query) return true;
+    const searchable = [row.name, row.slug, row.category, (row.chains || []).join(' ')]
+      .join(' ')
+      .toLowerCase();
+    return searchable.includes(query);
+  }
+
+  function getFilteredRows() {
+    return DATA.rows.filter((row) => matchesFilters(row, false));
+  }
+
+  function getFilteredLive() {
+    return DATA.live.filter((row) => matchesFilters(row, true));
   }
 
   function sortKeyFor(row, key) {
     switch (key) {
+      case 'rank':
+        return row.rank === undefined ? Infinity : row.rank;
       case 'name':
         return row.name.toLowerCase();
       case 'tvl':
@@ -344,14 +473,16 @@
         return row.change_7d === null ? -Infinity : row.change_7d;
       case 'age':
         return row.age_days === null ? Infinity : row.age_days;
+      case 'signal':
+        return row.signal_score === undefined ? -Infinity : row.signal_score;
+      case 'mcap':
+        return row.mcap_usd === null ? -Infinity : row.mcap_usd;
       default:
         return row.implied_value_usd;
     }
   }
 
-  function getSortedRows(list) {
-    const key = state.sort;
-    const dir = state.dir;
+  function sortList(list, key, dir) {
     return list.slice().sort((a, b) => {
       const av = sortKeyFor(a, key);
       const bv = sortKeyFor(b, key);
@@ -367,15 +498,101 @@
 
   // Pre-compute static dropdown option lists and total implied value once.
   const ALL_CATEGORIES = Array.from(
-    new Set(DATA.rows.map((r) => r.category || 'Other')),
+    new Set([...DATA.rows, ...DATA.live].map((r) => rowCategory(r))),
   ).sort();
 
   const ALL_CHAINS = Array.from(
-    new Set(DATA.rows.flatMap((r) => r.chains || [])),
+    new Set([...DATA.rows, ...DATA.live].flatMap((r) => r.chains || [])),
   ).sort();
 
   const TOTAL_IMPLIED_USD = sumImplied(DATA.rows);
   const ROWS_BY_SLUG = new Map(DATA.rows.map((r) => [r.slug, r]));
+
+  // -------------------------------------------------------------------------
+  // Charts (SVG, built as strings: compact and dependency-free)
+  // -------------------------------------------------------------------------
+
+  function categoryBreakdown() {
+    const totals = new Map();
+    for (const row of DATA.rows) {
+      const cat = rowCategory(row);
+      totals.set(cat, (totals.get(cat) ?? 0) + row.implied_value_usd);
+    }
+    const top = [...totals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8);
+    const other = [...totals.entries()]
+      .slice(8)
+      .reduce((acc, [, v]) => acc + v, 0);
+    if (other > 0) top.push(['Other', other]);
+    const max = Math.max(...top.map(([, v]) => v), 1);
+    const rowH = 26;
+    const height = top.length * rowH + 8;
+    const bars = top
+      .map(([cat, value], i) => {
+        const y = 8 + i * rowH;
+        const w = Math.max(4, Math.round((value / max) * 380));
+        return `<text x="0" y="${y + 13}" fill="#8b98a9" font-size="12">${escapeHtml(cat)}</text>` +
+          `<rect x="150" y="${y + 3}" width="${w}" height="14" rx="3" fill="#2dd4a8" opacity="${i < 3 ? '1' : '0.55'}"/>` +
+          `<text x="${156 + w}" y="${y + 13}" fill="#e6edf3" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">${escapeHtml(formatUsd(value))}</text>`;
+      })
+      .join('');
+    return `<svg viewBox="0 0 600 ${height}" width="100%" role="img" aria-label="Implied value by category">${bars}</svg>`;
+  }
+
+  function tvlScatter() {
+    const pts = DATA.rows.map((r) => ({ x: Math.log10(Math.max(1, r.tvl_usd)), y: Math.log10(Math.max(1, r.implied_value_usd)), w: WATCHLIST_SLUGS.has(r.slug) }));
+    const xs = pts.map((p) => p.x);
+    const ys = pts.map((p) => p.y);
+    const x0 = Math.min(...xs) - 0.15;
+    const x1 = Math.max(...xs) + 0.15;
+    const y0 = Math.min(...ys) - 0.15;
+    const y1 = Math.max(...ys) + 0.15;
+    const W = 600;
+    const H = 260;
+    const padL = 44;
+    const padB = 28;
+    const padT = 10;
+    const padR = 10;
+    const px = (x) => padL + ((x - x0) / (x1 - x0)) * (W - padL - padR);
+    const py = (y) => padT + (1 - (y - y0) / (y1 - y0)) * (H - padT - padB);
+    const refY = (x) => x + Math.log10(Math.max(0.0001, DATA.global_ratio));
+    const line = `<line x1="${px(x0).toFixed(1)}" y1="${py(refY(x0)).toFixed(1)}" x2="${px(x1).toFixed(1)}" y2="${py(refY(x1)).toFixed(1)}" stroke="#f5b544" stroke-width="1.5" stroke-dasharray="5 4"/>`;
+    const dots = pts
+      .map((p) => `<circle cx="${px(p.x).toFixed(1)}" cy="${py(p.y).toFixed(1)}" r="${p.w ? 4 : 2.6}" fill="${p.w ? '#2dd4a8' : '#8b98a9'}" opacity="${p.w ? '0.95' : '0.6'}"/>`)
+      .join('');
+    const xTicks = [6, 7, 8, 9].filter((v) => v >= x0 && v <= x1);
+    const yTicks = [6, 7, 8].filter((v) => v >= y0 && v <= y1);
+    const axes =
+      xTicks.map((v) => `<text x="${px(v).toFixed(1)}" y="${H - 8}" fill="#8b98a9" font-size="11" text-anchor="middle">$${'1e' + v}</text>`).join('') +
+      yTicks.map((v) => `<text x="${padL - 6}" y="${(py(v) + 4).toFixed(1)}" fill="#8b98a9" font-size="11" text-anchor="end">$${'1e' + v}</text>`).join('');
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="TVL against implied value, log scale">${line}${dots}${axes}</svg>`;
+  }
+
+  function renderCharts() {
+    return h(
+      'section',
+      { class: 'panel charts' },
+      h('h2', { text: 'Where the implied value sits' }),
+      h(
+        'div',
+        { class: 'chart-grid' },
+        h(
+          'div',
+          { class: 'chart' },
+          h('h3', { text: 'Implied value by category' }),
+          h('div', { html: categoryBreakdown() }),
+        ),
+        h(
+          'div',
+          { class: 'chart' },
+          h('h3', { text: 'TVL against implied value' }),
+          h('div', { html: tvlScatter() }),
+          h('p', { class: 'sub', text: 'Log scale. Teal dots are watchlist protocols; the dashed line is the market-wide ratio.' }),
+        ),
+      ),
+    );
+  }
 
   // -------------------------------------------------------------------------
   // Page sections
@@ -445,7 +662,7 @@
           'div',
           { class: 'fact' },
           h('span', { text: 'Live-token protocols set aside' }),
-          h('b', { text: String(DATA.live_size) }),
+          h('b', { text: String(DATA.live_total) }),
         ),
       ),
     );
@@ -538,7 +755,7 @@
     const countLabel =
       state.tab === 'pre-token'
         ? `${filteredCount} rows shown`
-        : `${DATA.live.length} live-token protocols`;
+        : `${filteredCount} live-token protocols`;
 
     return h(
       'div',
@@ -557,8 +774,9 @@
     );
   }
 
-  function renderSortHeader(key, label) {
-    const active = state.sort === key;
+  function renderSortHeader(key, label, forLive) {
+    const active = forLive ? state.liveSort === key : state.sort === key;
+    const dir = forLive ? state.liveDir : state.dir;
     return h(
       'th',
       { scope: 'col' },
@@ -567,22 +785,29 @@
         {
           type: 'button',
           onclick: () => {
-            if (state.sort === key) state.dir = -state.dir;
-            else {
+            if (forLive) {
+              if (state.liveSort === key) state.liveDir = -state.liveDir;
+              else {
+                state.liveSort = key;
+                state.liveDir = -1;
+              }
+            } else if (state.sort === key) {
+              state.dir = -state.dir;
+            } else {
               state.sort = key;
-              state.dir = -1;
+              state.dir = key === 'rank' ? 1 : -1;
             }
             render();
           },
         },
         label,
-        active ? h('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null,
+        active ? h('span', { 'aria-hidden': 'true', text: dir < 0 ? ' v' : ' ^' }) : null,
       ),
     );
   }
 
   function renderBoardTable(filtered) {
-    const list = getSortedRows(filtered);
+    const list = sortList(filtered, state.sort, state.dir);
     if (list.length === 0) {
       return h(
         'div',
@@ -617,6 +842,7 @@
       const growthClass = row.change_7d === null ? '' : row.change_7d >= 0 ? 'pos' : 'neg';
       const watchTag = WATCHLIST_SLUGS.has(row.slug) ? ' - watchlist' : '';
       const barPct = Math.max(3, Math.round((row.implied_value_usd / maxImplied) * 100));
+      const badgeClass = row.rank <= 3 ? 'rank-badge top3' : 'rank-badge';
 
       const tr = h(
         'tr',
@@ -632,7 +858,7 @@
             }
           },
         },
-        h('td', null, h('span', { class: 'rank-badge', text: String(row.rank) })),
+        h('td', null, h('span', { class: badgeClass, text: String(row.rank) })),
         h(
           'td',
           null,
@@ -649,6 +875,7 @@
         h('td', { class: 'num', text: formatUsd(row.tvl_usd) }),
         h('td', { class: `num ${growthClass}`.trim(), text: growthText }),
         h('td', { class: 'num', text: formatAge(row.age_days) }),
+        h('td', { class: 'num', text: String(row.signal_score) }),
         h(
           'td',
           null,
@@ -683,12 +910,13 @@
             h(
               'tr',
               null,
-              renderSortHeader('implied', 'Rank'),
-              renderSortHeader('name', 'Protocol'),
-              renderSortHeader('tvl', 'TVL'),
-              renderSortHeader('growth', '7d'),
-              renderSortHeader('age', 'Age'),
-              renderSortHeader('implied', 'Implied value'),
+              renderSortHeader('rank', 'Rank', false),
+              renderSortHeader('name', 'Protocol', false),
+              renderSortHeader('tvl', 'TVL', false),
+              renderSortHeader('growth', '7d', false),
+              renderSortHeader('age', 'Age', false),
+              renderSortHeader('signal', 'Signal', false),
+              renderSortHeader('implied', 'Implied value', false),
               h('th', { scope: 'col', text: 'Token' }),
             ),
           ),
@@ -698,14 +926,41 @@
     );
   }
 
-  function renderLiveTable() {
+  function renderLiveTable(filtered) {
+    const list = sortList(filtered, state.liveSort, state.liveDir);
+    if (list.length === 0) {
+      return h(
+        'div',
+        { class: 'panel' },
+        h(
+          'div',
+          { class: 'empty' },
+          h('h2', { text: 'No live-token protocol matches that filter' }),
+          h('p', { text: 'Clear the search or pick another category to see them again.' }),
+          h('button', {
+            class: 'button primary',
+            type: 'button',
+            text: 'Clear filters',
+            onclick: () => {
+              state.q = '';
+              state.category = 'all';
+              state.chain = 'all';
+              state.watchlistOnly = false;
+              syncHashFromState();
+              render();
+            },
+          }),
+        ),
+      );
+    }
+
     const tbody = h('tbody');
-    for (const row of DATA.live) {
+    for (const row of list) {
       const growthClass = row.change_7d === null ? '' : row.change_7d >= 0 ? 'pos' : 'neg';
       tbody.appendChild(
         h(
           'tr',
-          null,
+          { class: 'live-row' },
           h('td', null, h('span', { class: 'rank-badge', text: 'live' })),
           h(
             'td',
@@ -736,10 +991,10 @@
         { class: 'table-wrap' },
         h(
           'table',
-          null,
+          { class: 'live-table' },
           h('caption', {
             class: 'sub',
-            text: 'Token live: these protocols already trade, so their market cap is a fact, not a model. They are set aside from the pre-token ranking.',
+            text: `Token live: these ${DATA.live_total} protocols already trade, so their market cap is a fact, not a model. They are set aside from the pre-token ranking.`,
           }),
           h(
             'thead',
@@ -748,10 +1003,10 @@
               'tr',
               null,
               h('th', { scope: 'col', text: 'Status' }),
-              h('th', { scope: 'col', text: 'Protocol' }),
-              h('th', { scope: 'col', text: 'TVL' }),
-              h('th', { scope: 'col', text: '7d' }),
-              h('th', { scope: 'col', text: 'Market cap' }),
+              renderSortHeader('name', 'Protocol', true),
+              renderSortHeader('tvl', 'TVL', true),
+              renderSortHeader('growth', '7d', true),
+              renderSortHeader('mcap', 'Market cap', true),
               h('th', { scope: 'col', text: 'Token' }),
             ),
           ),
@@ -766,8 +1021,7 @@
     const topRatios = (DATA.ratios || []).slice(0, 8);
     const formulaText =
       `implied = round( tvl_usd x ratio x (1 + clamp(change_7d, ${m.growth_floor}, ${m.growth_cap}) / 100 x ${m.growth_weight}) ` +
-      `x (${m.maturity_floor} + min(age_days, ${m.maturity_days}) / ${m.maturity_days} x ${m.maturity_range}) ` +
-      `x (1 + ${m.chain_step} x min(chains - 1, ${m.chain_cap})) )`;
+      `x maturity(age) x (1 + ${m.chain_step} x min(chains - 1, ${m.chain_cap})) )`;
 
     return h(
       'section',
@@ -781,10 +1035,10 @@
       h('p', {
         class: 'sub',
         text:
-          `The ratio is the comparables argument: the median market-cap-to-TVL of the token-bearing protocols in the same category, computed from this snapshot. ` +
-          `A category whose token has never traded takes the market-wide median of ${formatFixed4(DATA.global_ratio)}. ` +
-          `TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; ` +
-          `an unlisted age uses ${m.unknown_age_days} days.`,
+          `The ratio is the comparables argument: the median market-cap-to-TVL of the token-bearing protocols in the same category, computed from this snapshot, with each token's market cap divided by the combined TVL of every protocol carrying its symbol. ` +
+          `A category with fewer than ${m.min_comparables} comparables takes the smaller of its own median and its family median (Vaults & Curators, Lending & CDP, RWA & Yield); a category with none takes the family median, or the market-wide median of ${formatFixed4(DATA.global_ratio)} when it has no family. ` +
+          `Maturity peaks in the 6-18 month window (${m.maturity_sweet_start}-${m.maturity_sweet_end} days, ${m.maturity_peak}x) and falls to ${m.maturity_young_floor}x for very young protocols and ${m.maturity_old_floor}x for very old ones; an unknown age uses ${m.unknown_maturity}x. ` +
+          `Age is the time since the protocol was first listed, the best record of how long it has run with no token.`,
       }),
       h(
         'div',
@@ -800,7 +1054,7 @@
       ),
       h('p', {
         class: 'sub',
-        text: 'The early radar is every pre-token protocol below the watchlist floor that the watchlist rule keeps, by TVL, and the live-token protocols are set aside with their market caps shown.',
+        text: 'The early radar is every pre-token protocol below the watchlist floor that the watchlist rule keeps, by TVL, topped up to 178 rows from the largest pre-token protocols above the floor. Six sub-protocols whose parent token already trades are removed. Centralised-exchange, bridge, liquid-staking and liquid-restaking protocols never enter the comparables pool, and the categories actually in use on this board include CDP, Yield Aggregator and Indexes. The live-token protocols are set aside with their market caps shown.',
       }),
     );
   }
@@ -816,7 +1070,7 @@
         'A protocol on this board records no token in the snapshot; that is DefiLlama\u2019s record, not proof it has none. Implied value is this entry\u2019s own claim about what a launch would be worth if the protocol\u2019s record stayed as it is. It does not predict whether or when a token is issued.',
       ),
       h('p', {
-        text: `Snapshot ${DATA.as_of} \u00b7 ${DATA.source} \u00b7 ${DATA.board_size} rows, ${DATA.watchlist_size} on the watchlist, ${DATA.early_size} early, ${DATA.live_size} live-token protocols set aside \u00b7 model ${DATA.model_version}`,
+        text: `Snapshot ${DATA.as_of} \u00b7 ${DATA.source} \u00b7 ${DATA.board_size} rows, ${DATA.watchlist_size} on the watchlist, ${DATA.early_size} early, ${DATA.live_total} live-token protocols set aside \u00b7 model ${DATA.model_version}`,
       }),
     );
   }
@@ -851,6 +1105,33 @@
       h('span', { text: label }),
       h('b', { class: 'num', text: value }),
     );
+  }
+
+  function waterfallSvg(row) {
+    const steps = [
+      { label: 'TVL', value: row.tvl_usd, mult: null },
+      { label: `x ratio ${formatFixed4(row.ratio)}`, value: row.tvl_usd * row.ratio, mult: row.ratio },
+      { label: `x growth ${formatFixed4(row.growth_multiplier)}`, value: row.tvl_usd * row.ratio * row.growth_multiplier, mult: row.growth_multiplier },
+      { label: `x maturity ${formatFixed4(row.maturity_multiplier)}`, value: row.tvl_usd * row.ratio * row.growth_multiplier * row.maturity_multiplier, mult: row.maturity_multiplier },
+      { label: `x chains ${formatFixed4(row.chain_multiplier)}`, value: row.implied_value_usd, mult: row.chain_multiplier },
+    ];
+    const logs = steps.map((s) => Math.log10(Math.max(1, s.value)));
+    const lo = Math.min(...logs) - 0.2;
+    const hi = Math.max(...logs) + 0.2;
+    const W = 480;
+    const rowH = 24;
+    const height = steps.length * rowH + 6;
+    const bars = steps
+      .map((s, i) => {
+        const y = 4 + i * rowH;
+        const w = Math.max(6, Math.round(((logs[i] - lo) / (hi - lo)) * 260));
+        const last = i === steps.length - 1;
+        return `<text x="0" y="${y + 13}" fill="#8b98a9" font-size="11">${escapeHtml(s.label)}</text>` +
+          `<rect x="150" y="${y + 3}" width="${w}" height="13" rx="3" fill="${last ? '#f5b544' : '#2dd4a8'}" opacity="${last ? '1' : '0.7'}"/>` +
+          `<text x="${156 + w}" y="${y + 13}" fill="#e6edf3" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">${escapeHtml(formatUsd(s.value))}</text>`;
+      })
+      .join('');
+    return `<svg viewBox="0 0 ${W} ${height}" width="100%" role="img" aria-label="Implied value waterfall">${bars}</svg>`;
   }
 
   function openDetail(slug) {
@@ -901,6 +1182,7 @@
         'section',
         { class: 'detail-section' },
         h('h3', { text: 'Implied value' }),
+        h('div', { class: 'waterfall', html: waterfallSvg(row) }),
         h(
           'div',
           { class: 'equation' },
@@ -911,6 +1193,7 @@
           equationRow('Growth multiplier', formatFixed4(row.growth_multiplier), false),
           equationRow('Maturity multiplier', formatFixed4(row.maturity_multiplier), false),
           equationRow('Chain multiplier', formatFixed4(row.chain_multiplier), false),
+          equationRow('Launch signal', `${row.signal_score} / 100`, false),
           equationRow('Implied value', formatUsd(row.implied_value_usd), true),
         ),
         h('p', {
@@ -961,15 +1244,17 @@
       }
     }
 
-    const filtered = getFilteredRows();
+    const isLive = state.tab === 'live';
+    const filtered = isLive ? getFilteredLive() : getFilteredRows();
     const shell = h(
       'div',
       { class: 'shell' },
       renderHeader(),
       renderLede(),
+      renderCharts(),
       renderControls(filtered.length),
-      state.tab === 'pre-token' ? renderBoardTable(filtered) : renderLiveTable(),
-      state.tab === 'pre-token' ? renderModelPanel() : null,
+      isLive ? renderLiveTable(filtered) : renderBoardTable(filtered),
+      isLive ? null : renderModelPanel(),
       renderFooter(),
     );
 
