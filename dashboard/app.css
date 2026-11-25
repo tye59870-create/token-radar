@@ -1,5 +1,5 @@
-/* Token Radar's theme: a dark radar console. Five palette values, two radii and two families
-   are the whole style; everything else is spacing, a hairline and a type step. */
+/* Token Radar theme: a dark radar console. Five palette values, two radii and two type
+   families carry the whole look; everything else is spacing, a hairline and a type step. */
 :root {
   --bg: #0a0e14;
   --surface: #10161f;
